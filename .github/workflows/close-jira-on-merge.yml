@@ -1,0 +1,115 @@
+name: Close Jira Issue on PR Merge to Develop
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - develop
+
+jobs:
+  close-jira-issue:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Extract Jira Issue Key
+        id: extract
+        run: |
+          # Try branch name first, then PR title
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+
+          ISSUE_KEY=$(echo "$BRANCH $PR_TITLE" | grep -oE '[A-Z]+-[0-9]+' | head -1)
+
+          if [ -z "$ISSUE_KEY" ]; then
+            echo "No Jira issue key found in branch '$BRANCH' or PR title '$PR_TITLE'. Skipping."
+            echo "found=false" >> $GITHUB_OUTPUT
+          else
+            echo "Jira issue key: $ISSUE_KEY"
+            echo "issue_key=$ISSUE_KEY" >> $GITHUB_OUTPUT
+            echo "found=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get Available Transitions
+        if: steps.extract.outputs.found == 'true'
+        id: transitions
+        run: |
+          RESPONSE=$(curl -s -o response.json -w "%{http_code}" \
+            -u "${{ secrets.JIRA_USER_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+            -H "Accept: application/json" \
+            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/${{ steps.extract.outputs.issue_key }}/transitions")
+
+          if [ "$RESPONSE" != "200" ]; then
+            echo "Failed to get transitions. HTTP status: $RESPONSE"
+            cat response.json
+            exit 1
+          fi
+
+          # Look for a transition named Done, Closed, or Terminado (case-insensitive)
+          TRANSITION_ID=$(cat response.json | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          names = ['done', 'closed', 'terminado', 'resolved', 'complete']
+          for t in data.get('transitions', []):
+              if t['name'].lower() in names:
+                  print(t['id'])
+                  break
+          ")
+
+          if [ -z "$TRANSITION_ID" ]; then
+            echo "No matching 'Done/Closed' transition found. Available transitions:"
+            cat response.json | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for t in data.get('transitions', []):
+              print(f\"  - {t['id']}: {t['name']}\")
+            "
+            exit 1
+          fi
+
+          echo "transition_id=$TRANSITION_ID" >> $GITHUB_OUTPUT
+
+      - name: Transition Jira Issue to Done
+        if: steps.extract.outputs.found == 'true'
+        run: |
+          RESPONSE=$(curl -s -o response.json -w "%{http_code}" \
+            -X POST \
+            -u "${{ secrets.JIRA_USER_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d '{"transition": {"id": "${{ steps.transitions.outputs.transition_id }}"}}' \
+            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/${{ steps.extract.outputs.issue_key }}/transitions")
+
+          if [ "$RESPONSE" != "204" ]; then
+            echo "Failed to transition issue. HTTP status: $RESPONSE"
+            cat response.json
+            exit 1
+          fi
+
+          echo "Successfully transitioned ${{ steps.extract.outputs.issue_key }} to Done."
+
+      - name: Add Comment to Jira Issue
+        if: steps.extract.outputs.found == 'true'
+        run: |
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          MERGED_BY="${{ github.event.pull_request.merged_by.login }}"
+
+          curl -s -X POST \
+            -u "${{ secrets.JIRA_USER_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"body\": {
+                \"type\": \"doc\",
+                \"version\": 1,
+                \"content\": [{
+                  \"type\": \"paragraph\",
+                  \"content\": [{
+                    \"type\": \"text\",
+                    \"text\": \"PR mergeado a develop por @${MERGED_BY}: ${PR_TITLE} - ${PR_URL}\"
+                  }]
+                }]
+              }
+            }" \
+            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/${{ steps.extract.outputs.issue_key }}/comment"
