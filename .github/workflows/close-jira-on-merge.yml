@@ -38,7 +38,9 @@ jobs:
             -u "${{ secrets.JIRA_USER_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
             -H "Accept: application/json" \
             "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/${{ steps.extract.outputs.issue_key }}/transitions")
-
+          
+          echo $RESPONSE 
+          
           if [ "$RESPONSE" != "200" ]; then
             echo "Failed to get transitions. HTTP status: $RESPONSE"
             cat response.json
